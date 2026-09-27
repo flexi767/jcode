@@ -10,38 +10,116 @@ fn desired_nofile_soft_limit_only_raises_when_possible() {
 #[cfg(unix)]
 #[test]
 fn spawn_detached_creates_new_session() {
-    use tempfile::NamedTempFile;
+    use std::io::{self, Read};
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
 
-    let output = NamedTempFile::new().expect("temp file");
-    let output_path = output.path().to_string_lossy().to_string();
+    struct OwnedChild(Child);
+
+    impl OwnedChild {
+        fn cleanup(&mut self) -> io::Result<ExitStatus> {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            self.0.kill()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.0.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "child cleanup"));
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if let Err(error) = self.cleanup() {
+                if std::thread::panicking() {
+                    eprintln!("test child cleanup failed: {error}");
+                } else {
+                    panic!("test child cleanup failed: {error}");
+                }
+            }
+        }
+    }
+
     let parent_sid = unsafe { libc::getsid(0) };
+    assert!(parent_sid > 0, "read parent session ID");
 
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg("ps -o sid= -p $$ > \"$JCODE_TEST_OUTPUT\"")
-        .env("JCODE_TEST_OUTPUT", &output_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    for detached in [false, true] {
+        // Only shell builtins: no descendants. Hold stdin open until cleanup so
+        // the ready child remains alive while its session ID is inspected.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf R; read -r release"])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = OwnedChild(if detached {
+            super::spawn_detached(&mut cmd).expect("spawn detached child")
+        } else {
+            cmd.spawn().expect("spawn ordinary child")
+        });
 
-    let mut child = super::spawn_detached(&mut cmd).expect("spawn detached child");
-    let status = child.wait().expect("wait for child");
-    assert!(status.success(), "child should exit successfully");
+        let stdout = child.0.stdout.as_mut().expect("child readiness pipe");
+        let mut ready = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "child readiness timed out");
+            let timeout = remaining.as_millis().max(1) as i32;
+            let result = unsafe { libc::poll(&mut ready, 1, timeout) };
+            if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            assert!(result > 0, "child readiness poll failed or timed out");
+            assert_ne!(ready.revents & libc::POLLIN, 0, "child exited before ready");
+            break;
+        }
+        let mut byte = [0];
+        stdout.read_exact(&mut byte).expect("read readiness byte");
+        assert_eq!(byte, [b'R']);
+        assert!(child.0.try_wait().expect("check child is alive").is_none());
 
-    let child_sid = std::fs::read_to_string(&output_path)
-        .expect("read child sid")
-        .trim()
-        .parse::<u32>()
-        .expect("parse child sid");
-
-    assert_eq!(
-        child_sid,
-        child.id(),
-        "detached child should lead its own session"
-    );
-    assert_ne!(
-        child_sid as i32, parent_sid,
-        "detached child should not share parent session"
-    );
+        let child_pid = child.0.id() as libc::pid_t;
+        let child_sid = unsafe { libc::getsid(child_pid) };
+        assert!(child_sid > 0, "read live child session ID");
+        if detached {
+            assert_eq!(
+                child_sid, child_pid,
+                "detached child should lead its own session"
+            );
+            assert_ne!(
+                child_sid, parent_sid,
+                "detached child should not share parent session"
+            );
+            // Exercise the same guard cleanup used when an assertion unwinds.
+            let unwind = std::panic::catch_unwind(move || -> () {
+                let _owned_child = child;
+                std::panic::resume_unwind(Box::new(()));
+            });
+            assert!(unwind.is_err());
+        } else {
+            assert_eq!(
+                child_sid, parent_sid,
+                "ordinary child should share parent session"
+            );
+            child.cleanup().expect("terminate and reap test child");
+            drop(child);
+        }
+        let wait_result = unsafe { libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(wait_result, -1, "test child should already be reaped");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
 }
 
 #[cfg(windows)]
