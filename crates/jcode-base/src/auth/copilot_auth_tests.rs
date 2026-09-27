@@ -3,6 +3,66 @@ use anyhow::{Result, anyhow};
 
 use tempfile::TempDir;
 
+const COPILOT_FIXTURE_ENV_KEYS: [&str; 9] = [
+    "HOME",
+    "JCODE_HOME",
+    "XDG_CONFIG_HOME",
+    "TMPDIR",
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN",
+    "JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES",
+];
+
+struct CopilotFixtureEnv {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    jcode_home: PathBuf,
+}
+
+impl CopilotFixtureEnv {
+    fn new(root: &Path) -> Result<Self> {
+        let root = root.canonicalize()?;
+        let home = root.join("home");
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&tmp)?;
+        let guard = Self {
+            previous: COPILOT_FIXTURE_ENV_KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+            jcode_home: root.join("jcode-home"),
+        };
+        crate::env::set_var("HOME", home);
+        crate::env::set_var("TMPDIR", tmp);
+        crate::env::set_var("JCODE_HOME", &guard.jcode_home);
+        crate::env::set_var(
+            "XDG_CONFIG_HOME",
+            guard.jcode_home.join("external").join(".config"),
+        );
+        for key in &COPILOT_FIXTURE_ENV_KEYS[4..] {
+            crate::env::remove_var(key);
+        }
+        crate::config::Config::invalidate_cache();
+        crate::auth::AuthStatus::invalidate_cache();
+        Ok(guard)
+    }
+}
+
+impl Drop for CopilotFixtureEnv {
+    fn drop(&mut self) {
+        for (key, previous) in self.previous.drain(..).rev() {
+            match previous {
+                Some(value) => crate::env::set_var(key, value),
+                None => crate::env::remove_var(key),
+            }
+        }
+        crate::config::Config::invalidate_cache();
+        crate::auth::AuthStatus::invalidate_cache();
+    }
+}
+
 #[test]
 fn copilot_api_token_not_expired() {
     let future_ts = chrono::Utc::now().timestamp() + 3600;
@@ -201,38 +261,86 @@ fn save_and_load_github_token() -> Result<()> {
 fn save_github_token_creates_config_dir() -> Result<()> {
     let _guard = crate::storage::lock_test_env();
     let dir = TempDir::new().map_err(|e| anyhow!(e))?;
-    let config_dir = dir.path().join("github-copilot");
-    let prev_jcode_home = std::env::var_os("JCODE_HOME");
-    let prev_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let previous: Vec<_> = COPILOT_FIXTURE_ENV_KEYS
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+    {
+        let env = CopilotFixtureEnv::new(dir.path())?;
+        let config_dir = env
+            .jcode_home
+            .join("external")
+            .join(".config")
+            .join("github-copilot");
 
-    crate::env::remove_var("JCODE_HOME");
-    crate::env::set_var(
-        "XDG_CONFIG_HOME",
-        dir.path()
-            .to_str()
-            .ok_or_else(|| anyhow!("temp dir path should be valid UTF-8"))?,
-    );
-
-    let result = save_github_token("gho_newtoken", "testuser");
-    assert!(result.is_ok());
-
-    let hosts_path = config_dir.join("hosts.json");
-    assert!(hosts_path.exists());
-
-    let loaded = load_token_from_json(&hosts_path)?;
-    assert_eq!(loaded, "gho_newtoken");
-
-    if let Some(prev) = prev_jcode_home {
-        crate::env::set_var("JCODE_HOME", prev);
-    } else {
+        // Pin the XDG fallback, then restore the explicit sandbox for the trust
+        // write. Both routes must save to exactly the same hosts.json path.
         crate::env::remove_var("JCODE_HOME");
-    }
+        assert_eq!(legacy_copilot_config_dir(), config_dir);
+        crate::env::set_var("JCODE_HOME", &env.jcode_home);
+        assert_eq!(legacy_copilot_config_dir(), config_dir);
 
-    if let Some(prev) = prev_xdg_config_home {
-        crate::env::set_var("XDG_CONFIG_HOME", prev);
-    } else {
-        crate::env::remove_var("XDG_CONFIG_HOME");
+        let config_path = env.jcode_home.join("config.toml");
+        assert_eq!(crate::config::Config::path(), Some(config_path.clone()));
+        assert!(
+            !config_dir.exists(),
+            "token directory must be created by save"
+        );
+        assert!(!config_path.exists(), "trust config must be created by save");
+        save_github_token("gho_newtoken", "testuser")?;
+
+        let hosts_path = config_dir.join("hosts.json");
+        assert_eq!(saved_hosts_path(), hosts_path);
+        let root = dir.path().canonicalize()?;
+        assert!(hosts_path.canonicalize()?.starts_with(&root));
+        assert!(config_path.canonicalize()?.starts_with(&root));
+        assert_eq!(load_token_from_json(&hosts_path)?, "gho_newtoken");
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&hosts_path)?)?;
+        assert_eq!(saved["github.com"]["user"], "testuser");
+
+        let cfg = crate::config::Config::load_strict()?;
+        assert_eq!(
+            cfg.auth.trusted_external_source_paths,
+            vec![format!(
+                "{}|{}",
+                COPILOT_HOSTS_AUTH_SOURCE_ID,
+                hosts_path
+                    .canonicalize()?
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+            )]
+        );
+        assert!(cfg.auth.trusted_external_sources.is_empty());
+        assert!(crate::config::Config::external_auth_source_allowed_for_path(
+            COPILOT_HOSTS_AUTH_SOURCE_ID,
+            &hosts_path
+        ));
+        assert_eq!(load_github_token()?, "gho_newtoken");
     }
+    for (key, value) in previous {
+        assert!(std::env::var_os(key) == value, "fixture must restore {key}");
+    }
+    Ok(())
+}
+
+#[test]
+fn copilot_fixture_restores_environment_on_unwind() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let dir = TempDir::new()?;
+    let previous: Vec<_> = COPILOT_FIXTURE_ENV_KEYS
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+    let previous_config_path = crate::config::Config::path();
+    let unwind = std::panic::catch_unwind(|| -> () {
+        let _env = CopilotFixtureEnv::new(dir.path()).expect("private fixture environment");
+        std::panic::resume_unwind(Box::new(()));
+    });
+    assert!(unwind.is_err());
+    for (key, value) in previous {
+        assert!(std::env::var_os(key) == value, "unwind must restore {key}");
+    }
+    assert_eq!(crate::config::Config::path(), previous_config_path);
     Ok(())
 }
 
