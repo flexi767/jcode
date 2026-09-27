@@ -496,19 +496,12 @@ mod tests {
         assert!(error.to_string().contains("exceeds 2 bytes"));
     }
 
-    #[tokio::test]
-    async fn rejects_non_utf8_git_paths() {
-        use std::os::unix::ffi::OsStrExt;
-        let repo = repo().await;
-        let name = std::ffi::OsStr::from_bytes(b"non-utf8-\xff");
-        std::fs::write(repo.path().join(name), b"contents").unwrap();
-        assert!(
-            snapshot(repo.path())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("UTF-8")
-        );
+    #[test]
+    fn rejects_non_utf8_git_paths() {
+        let root = tempfile::tempdir().unwrap();
+        // Some filesystems reject non-UTF8 names before the collector can inspect them.
+        let error = collect(root.path(), b"non-utf8-\xff\0").unwrap_err();
+        assert!(error.to_string().contains("source path is not UTF-8"));
     }
 
     #[test]
