@@ -17,7 +17,12 @@ fn unknown_ctrl_chord_sets_hotkey_feedback_with_suggestion() {
         .expect("unknown chord should set feedback");
     assert!(message.contains("Ctrl+M"), "{message}");
     assert!(message.contains("isn't bound"), "{message}");
-    assert!(message.contains("Alt+M"), "{message}");
+    let nearest_chord = if cfg!(target_os = "macos") {
+        "nearest: ⌥+M"
+    } else {
+        "nearest: Alt+M"
+    };
+    assert!(message.contains(nearest_chord), "{message}");
     assert!(message.contains("side panel"), "{message}");
 
     // The renderer consumes the trait accessor; it must surface the same text

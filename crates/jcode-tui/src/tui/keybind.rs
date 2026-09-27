@@ -670,7 +670,12 @@ mod tests {
         assert!(binding.matches(KeyCode::Enter, KeyModifiers::ALT));
         assert!(!binding.matches(KeyCode::Enter, KeyModifiers::empty()));
         assert!(!binding.matches(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert_eq!(format_binding(&binding), "Alt+Enter");
+        let expected_label = if cfg!(target_os = "macos") {
+            "⌥+Enter"
+        } else {
+            "Alt+Enter"
+        };
+        assert_eq!(format_binding(&binding), expected_label);
     }
 
     #[test]
