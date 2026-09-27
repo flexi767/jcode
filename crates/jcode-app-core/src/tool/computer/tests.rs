@@ -162,13 +162,58 @@ fn schema_is_compact() {
     let total = tool.description().len() + schema.len();
     // ~4 chars/token; keep always-on cost roughly under ~875 tokens. The bound
     // leaves room for the full input-field set plus the short safety/restraint
-    // guidance in the description (act only on the requested task; prefer
-    // background mechanisms) while still flagging any real ballooning.
+    // guidance in the description and schema (act only on the requested task;
+    // prefer background mechanisms) while still flagging any real ballooning.
     assert!(
         total < 3500,
         "macos_computer_use tool always-on size grew to {total} chars (~{} tokens)",
         total / 4
     );
+}
+
+#[test]
+fn compact_guidance_preserves_live_desktop_policy() {
+    let tool = ComputerTool::new();
+    let schema = tool.parameters_schema();
+    let description = tool.description();
+    assert!(description.contains("live macOS"));
+    assert!(description.contains("on request only"));
+    assert!(description.contains("never proactively"));
+    assert!(description.contains("BACKGROUND AX"));
+
+    let properties = &schema["properties"];
+    let action = properties["action"]["description"].as_str().unwrap();
+    assert!(action.contains("discover"));
+    assert!(action.contains("Click/type only when AX cannot reach target"));
+    let app = properties["app"]["description"].as_str().unwrap();
+    assert!(app.contains("Prefer background AX/scripting"));
+    assert!(app.contains("over moving the cursor or stealing focus"));
+    let category = properties["category"]["description"].as_str().unwrap();
+    assert!(category.contains("Run setup first if permissions are missing"));
+    let x = properties["x"]["description"].as_str().unwrap();
+    assert!(x.contains("points (top-left origin)"));
+    assert!(
+        properties["y"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("points")
+    );
+    assert_eq!(properties["dry_run"]["type"], "boolean");
+    assert!(
+        properties["dry_run"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("without doing it")
+    );
+
+    let discovery = super::discover::discover(Some("all")).unwrap();
+    assert!(discovery.output.contains("never take proactive control"));
+    assert!(
+        discovery
+            .output
+            .contains("unless the user asked or the task strictly requires it")
+    );
+    assert!(discovery.output.contains("restore focus"));
 }
 
 // ---- live (need GUI + permissions); run with --ignored ----

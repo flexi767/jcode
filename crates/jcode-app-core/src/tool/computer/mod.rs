@@ -182,20 +182,13 @@ impl Tool for ComputerTool {
     }
 
     fn description(&self) -> &str {
-        "Control the macOS desktop: see the screen (screenshot/ocr/ui tree), click and type \
-         (visible coordinate input), act on UI elements in the BACKGROUND via Accessibility \
-         (press/set_value, no cursor movement), manage apps and windows, use the clipboard, and \
-         run AppleScript. Coordinates are in points (top-left origin). This is the user's live \
-         machine: act only on the requested task (not proactively) and prefer BACKGROUND \
-         AX/scripting over moving the cursor or stealing focus; click/type only when AX can't \
-         reach the target. Call action='discover' with a category for the full action set. Run \
-         action='setup' first if permissions are missing."
+        "Control live macOS on request only; never proactively. Prefer BACKGROUND AX."
     }
 
     fn parameters_schema(&self) -> Value {
-        // Progressive disclosure: only the common actions + discover are spelled
-        // out here to keep always-on prompt cost low (~370 tokens). Advanced
-        // actions and their params are returned by action="discover".
+        // Progressive disclosure: action specs are returned by action="discover".
+        // Declare every input field here and keep the live-desktop restraint
+        // and permission guidance in the compact descriptions.
         json!({
             "type": "object",
             "required": ["action"],
@@ -203,28 +196,24 @@ impl Tool for ComputerTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "description": "Common: screenshot, ocr, ui (see); click, type, key (visible input); \
-                        press, set_value (BACKGROUND AX action on an `element` handle); find_element; \
-                        run_applescript; setup, check_permissions; discover (load full action set). \
-                        Many more actions (move, drag, scroll, window/app management, clipboard, \
-                        select_menu, notify, ...) take the same fields; call discover for their params."
+                    "description": "Action name; discover for specs. Click/type only when AX cannot reach target."
                 },
                 "category": {
                     "type": "string",
                     "enum": ["mouse","keyboard","observe","ax","windows","apps","clipboard","scripting","system","setup","all"],
-                    "description": "For action='discover': which group to return full action specs for."
+                    "description": "Discover group. Run setup first if permissions are missing."
                 },
                 "x": { "type": "number", "description": "Screen X in points (top-left origin)." },
                 "y": { "type": "number", "description": "Screen Y in points." },
                 "text": { "type": "string", "description": "Text for type / set_clipboard / notify." },
                 "keys": { "type": "string", "description": "Key chord, e.g. cmd+space, return, esc, ctrl+shift+t." },
-                "app": { "type": "string", "description": "Target app/process name (AX, windows, scripting scope)." },
+                "app": { "type": "string", "description": "Target app/process. Prefer background AX/scripting over moving the cursor or stealing focus." },
                 "role": { "type": "string", "description": "AX role filter for find_element, e.g. AXButton." },
                 "title": { "type": "string", "description": "AX title/label substring for find_element." },
                 "value": { "type": "string", "description": "Value to match (find_element) or set (set_value)." },
                 "element": {
                     "type": "object",
-                    "description": "Element handle from find_element/ui: {app, path:[child indices]}. Used by press/set_value/get_value/perform_action.",
+                    "description": "AX handle {app,path:[child indices]} from ui/find_element; press/set_value/get_value/perform_action.",
                     "properties": {
                         "app": { "type": "string" },
                         "path": { "type": "array", "items": { "type": "integer" } }
