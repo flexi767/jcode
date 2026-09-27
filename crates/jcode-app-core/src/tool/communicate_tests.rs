@@ -741,6 +741,26 @@ fn communicate_input_aliases_to_session_and_target_session() {
 }
 
 #[test]
+fn cross_swarm_dm_input_preserves_optional_agent_destination() {
+    for target in ["review swarm", "swarm-id"] {
+        let coordinator: CommunicateInput = serde_json::from_value(json!({
+            "action": "dm", "message": "hi", "to_swarm": target
+        }))
+        .expect("parse cross-swarm coordinator destination");
+        assert_eq!(coordinator.to_swarm.as_deref(), Some(target));
+        assert_eq!(coordinator.to_session, None);
+
+        let agent: CommunicateInput = serde_json::from_value(json!({
+            "action": "dm", "message": "hi", "to_swarm": target,
+            "to_session": "worker-1"
+        }))
+        .expect("parse cross-swarm agent destination");
+        assert_eq!(agent.to_swarm.as_deref(), Some(target));
+        assert_eq!(agent.to_session.as_deref(), Some("worker-1"));
+    }
+}
+
+#[test]
 fn format_plan_status_includes_next_ready() {
     let output = format_plan_status(&crate::protocol::PlanGraphStatus {
         swarm_id: Some("swarm-a".to_string()),
@@ -1255,6 +1275,19 @@ fn schema_advertises_supported_swarm_fields() {
         props["to_session"]["description"],
         json!("Session ID or unique friendly name of one agent. Alias of target_session.")
     );
+    assert_eq!(props["to_swarm"]["type"], json!("string"));
+    let destination = props["to_swarm"]["description"]
+        .as_str()
+        .expect("cross-swarm destination description");
+    assert!(destination.contains("Cross-swarm label/id (list_swarms)"));
+    assert!(destination.contains("to_session: agent DM"));
+    assert!(destination.contains("no to_session: coordinator DM"));
+    assert_eq!(props["label"]["type"], json!("string"));
+    let label = props["label"]["description"]
+        .as_str()
+        .expect("label description");
+    assert!(label.contains("Required for spawn: short agent chip label"));
+    assert!(label.contains("set_swarm_label: new unique swarm label"));
     assert!(props.contains_key("channel"));
     assert!(props.contains_key("proposer_session"));
     assert!(props.contains_key("reason"));
