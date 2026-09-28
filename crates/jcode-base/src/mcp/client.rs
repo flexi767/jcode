@@ -175,9 +175,11 @@ impl McpClient {
         let inherited: HashMap<String, String> = std::env::vars().collect();
         let env = mcp_child_env(inherited, &config.env);
 
+        // `envs` overlays inherited values; clear them so filtering takes effect.
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
+            .env_clear()
             .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -504,6 +506,87 @@ done
             disabled: None,
             timeout_secs: None,
         }
+    }
+
+    fn environment_reporting_server_config() -> McpServerConfig {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"%s|%s|%s|%s","version":"0"}}}\n' "${JCODE_TEST_MCP_API_KEY-unset}" "$PATH" "$JCODE_RUNTIME_DIR" "${MCP_CHILD_ENV_EXTRA-unset}"
+      ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+  esac
+done
+"#;
+        let mut config = fake_server_config();
+        config.args[1] = script.to_string();
+        config
+    }
+
+    #[test]
+    fn mcp_child_environment_is_filtered_at_spawn() {
+        // A separate test process gives the client an ambient synthetic key
+        // without mutating the shared test harness environment.
+        let home = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .env_clear()
+            .env("PATH", "/bin:/usr/bin")
+            .env("TMPDIR", home.path())
+            .env("JCODE_HOME", home.path())
+            .env("JCODE_RUNTIME_DIR", home.path().join("runtime"))
+            .env("JCODE_NO_TELEMETRY", "1")
+            .env("JCODE_TEST_MCP_API_KEY", "ambient-only")
+            .env("JCODE_MCP_ENV_CHILD_TEST", "1")
+            .args([
+                "--exact",
+                "mcp::client::tests::mcp_child_environment_fixture",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run environment fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "fixture failed or did not run:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_child_environment_fixture() {
+        if std::env::var_os("JCODE_MCP_ENV_CHILD_TEST").is_none() {
+            return;
+        }
+        let runtime = std::env::var("JCODE_RUNTIME_DIR").expect("private runtime");
+
+        let config = environment_reporting_server_config();
+        let client = McpClient::connect("filtered-env".to_string(), &config)
+            .await
+            .expect("connect filtered fixture");
+        assert_eq!(
+            client.server_info().expect("server info").name,
+            format!("unset|/bin:/usr/bin|{runtime}|unset")
+        );
+
+        let mut config = environment_reporting_server_config();
+        config.env.insert(
+            "JCODE_TEST_MCP_API_KEY".to_string(),
+            "explicit-only".to_string(),
+        );
+        config.env.insert(
+            "MCP_CHILD_ENV_EXTRA".to_string(),
+            "server-value".to_string(),
+        );
+        let client = McpClient::connect("explicit-env".to_string(), &config)
+            .await
+            .expect("connect explicit fixture");
+        assert_eq!(
+            client.server_info().expect("server info").name,
+            format!("explicit-only|/bin:/usr/bin|{runtime}|server-value")
+        );
     }
 
     #[tokio::test]
